@@ -259,18 +259,15 @@ ssl_apply(){
   show_address
 }
 ssl_cloudflare(){
-  local d token account zone acme
-  say '【Cloudflare DNS 验证申请证书】'; say '无需公网 80 端口。域名必须属于你有 DNS 编辑权限的 Cloudflare 区域。'
+  local d token='' account='' zone='' acme rc=0 answer='' existing=0
+  say '【Cloudflare DNS 验证申请证书】'
+  say '无需公网 80 端口。域名必须属于你有 DNS 编辑权限的 Cloudflare 区域。'
   ask d '请输入证书域名：' "${DOMAIN:-}" || return 1
   valid_domain "$d" || { err '域名格式不正确'; return 1; }
-  read -rs -p '输入 Cloudflare API Token（输入不回显）：' token || return 1; printf '\n'
-  [[ -n "$token" ]] || { err 'Token 不能为空'; return 1; }
-  ask zone 'Cloudflare Zone ID（可留空，由 acme.sh 自动识别）：' '' || return 1
-  ask account 'Cloudflare Account ID（可留空）：' '' || return 1
   if ! need_cmd curl || ! need_cmd openssl; then err '缺少 curl 或 openssl'; return 1; fi
   acme='/root/.acme.sh/acme.sh'
   if [[ ! -x "$acme" ]]; then
-    say '检测到尚未安装 acme.sh。';
+    say '检测到尚未安装 acme.sh。'
     if ! confirm '是否从 acme.sh 官方站点下载安装脚本？'; then return 1; fi
     local f; f=$(mktemp /tmp/acme-install.XXXXXX.sh)
     if ! curl -fLsS --max-time 90 https://get.acme.sh -o "$f"; then err 'acme.sh 下载失败'; rm -f "$f"; return 1; fi
@@ -278,16 +275,55 @@ ssl_cloudflare(){
     bash "$f" || { rm -f "$f"; err 'acme.sh 安装失败'; return 1; }; rm -f "$f"
   fi
   [[ -x "$acme" ]] || { err 'acme.sh 不可执行'; return 1; }
-  info '正在使用 Cloudflare DNS 验证申请证书...'
-  local rc=0
-  CF_Token="$token" CF_Zone_ID="$zone" CF_Account_ID="$account" "$acme" --issue --dns dns_cf -d "$d" --keylength ec-256 --server letsencrypt || rc=$?
-  unset token
-  (( rc == 0 )) || { err '申请失败，请检查 Token 权限、域名所属 Zone 和日志'; return 1; }
-  ssl_paths "$d"; install -d -m 700 "$CERT_DIR"
-  "$acme" --install-cert --ecc -d "$d" --fullchain-file "$CERT_FULL" --key-file "$CERT_KEY" --reloadcmd 'x-ui restart' || { err '证书安装失败'; return 1; }
+  ssl_paths "$d"
+  # Already-issued certificates must be reused, not mistaken for a failed issuance.
+  # Prefer the installed fullchain; fall back to the acme.sh ECC certificate.
+  local acme_full="/root/.acme.sh/${d}_ecc/fullchain.cer"
+  if [[ -s "$CERT_FULL" ]] && openssl x509 -in "$CERT_FULL" -noout -checkend 86400 >/dev/null 2>&1; then
+    existing=1
+  elif [[ -s "$acme_full" ]] && openssl x509 -in "$acme_full" -noout -checkend 86400 >/dev/null 2>&1; then
+    existing=1
+  fi
+  if (( existing )); then
+    ok '检测到已有有效证书，无需重复申请。'
+    if confirm '是否复用现有证书并继续配置面板？'; then
+      :
+    else
+      return 0
+    fi
+  else
+    read -rs -p '输入 Cloudflare API Token（输入不回显）：' token || return 1; printf '\n'
+    [[ -n "$token" ]] || { err 'Token 不能为空'; return 1; }
+    ask zone 'Cloudflare Zone ID（可留空，由 acme.sh 自动识别）：' '' || return 1
+    ask account 'Cloudflare Account ID（可留空）：' '' || return 1
+    info '正在使用 Cloudflare DNS 验证申请证书...'
+    CF_Token="$token" CF_Zone_ID="$zone" CF_Account_ID="$account" "$acme" --issue --dns dns_cf -d "$d" --keylength ec-256 --server letsencrypt || rc=$?
+    unset token
+    # acme.sh can return a nonzero skip status when renewal is not due.
+    # Only proceed if a real, non-expiring certificate is present.
+    if (( rc != 0 )); then
+      if [[ -s "$acme_full" ]] && openssl x509 -in "$acme_full" -noout -checkend 86400 >/dev/null 2>&1; then
+        ok '已有有效证书，acme.sh 跳过了重复签发，将继续安装。'
+      else
+        err '未能取得有效证书，请检查 Token 权限、域名所属 Zone 和日志'
+        return 1
+      fi
+    fi
+  fi
+  install -d -m 700 "$CERT_DIR"
+  if ! "$acme" --install-cert --ecc -d "$d" --fullchain-file "$CERT_FULL" --key-file "$CERT_KEY" --reloadcmd 'x-ui restart'; then
+    err '证书安装或续期配置失败'; return 1
+  fi
+  if [[ ! -s "$CERT_FULL" || ! -s "$CERT_KEY" ]] || ! openssl x509 -in "$CERT_FULL" -noout -checkend 86400 >/dev/null 2>&1; then
+    err '证书文件缺失或已过期，不能标记成功'; return 1
+  fi
   chmod 600 "$CERT_KEY"; chmod 644 "$CERT_FULL"
-  ok '证书签发成功，自动续期配置已提交';
-  if confirm '是否立即把此证书应用到 3X-UI 面板？'; then ssl_apply "$d"; else DOMAIN="$d"; save_config; show_address; fi
+  ok '证书已安装，自动续期配置已提交'
+  if confirm '是否立即把此证书应用到 3X-UI 面板？'; then
+    ssl_apply "$d"
+  else
+    DOMAIN="$d"; save_config; show_address
+  fi
 }
 ssl_menu(){
   local c d
