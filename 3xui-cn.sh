@@ -60,23 +60,95 @@ configure_access(){
   esac
   save_config; ok '访问方式已保存（仅记录信息，不会自动创建 NAT 转发或 DNS 记录）';
 }
+# 从真实的 3X-UI SQLite 设置读取端口、路径和证书，避免缓存配置误导用户。
+PANEL_CERT_FILE=''
+PANEL_KEY_FILE=''
+read_panel_settings(){
+  local db='/etc/x-ui/x-ui.db' row k v
+  [[ -f "$db" ]] || return 1
+  if need_cmd python3; then
+    while IFS=$'\t' read -r k v; do
+      case "$k" in
+        webPort) valid_port "$v" && PANEL_PORT="$v";;
+        webBasePath) [[ -n "$v" ]] && WEB_PATH="$v";;
+        webCertFile) PANEL_CERT_FILE="$v";;
+        webKeyFile) PANEL_KEY_FILE="$v";;
+      esac
+    done < <(python3 - "$db" <<'PYSQL'
+import sqlite3,sys
+try:
+    con=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=3)
+    for k,v in con.execute('SELECT key,value FROM settings WHERE key IN ("webPort","webBasePath","webCertFile","webKeyFile")'):
+        print(str(k)+'\t'+str(v or ''))
+except Exception:
+    pass
+PYSQL
+    )
+  elif need_cmd sqlite3; then
+    while IFS='|' read -r k v; do
+      case "$k" in
+        webPort) valid_port "$v" && PANEL_PORT="$v";;
+        webBasePath) [[ -n "$v" ]] && WEB_PATH="$v";;
+        webCertFile) PANEL_CERT_FILE="$v";;
+        webKeyFile) PANEL_KEY_FILE="$v";;
+      esac
+    done < <(sqlite3 -separator '|' "$db" 'SELECT key,value FROM settings WHERE key IN ("webPort","webBasePath","webCertFile","webKeyFile");' 2>/dev/null)
+  else
+    warn '缺少 Python3 / sqlite3，无法核对面板实际设置。'
+    return 1
+  fi
+}
+https_enabled(){
+  [[ -n "$PANEL_CERT_FILE" && -n "$PANEL_KEY_FILE" && -s "$PANEL_CERT_FILE" && -s "$PANEL_KEY_FILE" ]] &&
+  openssl x509 -in "$PANEL_CERT_FILE" -noout -checkend 3600 >/dev/null 2>&1
+}
+panel_binary(){
+  local f
+  for f in /usr/local/x-ui/x-ui /root/x-ui/x-ui; do
+    [[ -x "$f" ]] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
 show_address(){
   local host port scheme path
+  PANEL_CERT_FILE=''; PANEL_KEY_FILE=''
+  read_panel_settings || true
   host="${DOMAIN:-$PUBLIC_HOST}"; port="${EXTERNAL_PORT:-}"; path="${WEB_PATH:-/}"
-  [[ "$path" == /* ]] || path="/$path"; [[ "$path" == */ ]] || path="$path/"
-  say '========== 面板访问地址 ==========';
-  if [[ -z "$host" ]]; then warn '尚未设置公网 IPv4 或域名，请先进入访问方式配置。'; else
-    if [[ "$NETWORK_TYPE" == nat && -z "$port" ]]; then warn 'NAT 外部端口未配置，暂时无法生成公网访问地址。'; else
-      [[ -n "$port" ]] || port="$PANEL_PORT"
-      if [[ "$HTTPS_MODE" == verified ]]; then scheme=https; else scheme=http; fi
-      say "候选地址：$scheme://$host:$port$path"
-      warn '这是根据配置生成的候选地址，不代表公网连通性已验证。'
-      if [[ "$HTTPS_MODE" != verified ]]; then warn '当前未确认 HTTPS，禁止通过公网 HTTP 输入管理员密码。'; fi
-    fi
+  [[ "$path" == /* ]] || path="/$path"
+  [[ "$path" == */ ]] || path="$path/"
+  say '========== 面板登录信息 =========='
+  say "面板服务：$(service_active && printf '运行中' || printf '未运行')"
+  say "访问域名：${DOMAIN:-未设置}"
+  say "公网 IPv4：${PUBLIC_HOST:-未设置}"
+  say "面板内部端口：$PANEL_PORT"
+  say "NAT 外部端口：${EXTERNAL_PORT:-未设置}"
+  say "访问路径：$path"
+  if https_enabled; then
+    scheme=https; say 'HTTPS 状态：已在面板配置有效证书'
+  else
+    scheme=http; say 'HTTPS 状态：未确认启用（请勿公网明文登录）'
   fi
-  say; say 'SSH 隧道（安全访问方式）：'; say "  ssh -N -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@服务器SSH地址 -p SSH外部端口";
-  say "  本机浏览器：http://127.0.0.1:${PANEL_PORT}${path}";
-  say '注意：如果面板已启用 HTTPS，本机隧道也应使用 https://，浏览器可能提示域名不匹配。';
+  if [[ -z "$host" ]]; then
+    warn '尚未设置域名或公网 IPv4。请使用主菜单第 13 项设置访问方式。'
+  elif [[ "$NETWORK_TYPE" == nat && -z "$port" ]]; then
+    warn 'NAT 外部端口未设置。请在服务商后台配置端口映射，再到主菜单第 13 项填写外部端口。'
+  else
+    [[ -n "$port" ]] || port="$PANEL_PORT"
+    say
+    say '========== 完整面板登录地址 =========='
+    say "$scheme://$host:$port$path"
+    say '======================================'
+    warn '这是根据当前设置生成的地址，公网 DNS 和 NAT 端口映射仍需实际验证。'
+    if [[ "$scheme" == http ]]; then warn '当前未确认 HTTPS，请勿通过公网 HTTP 输入管理员密码。'; fi
+  fi
+  say
+  say 'SSH 隧道访问（不依赖 NAT 面板端口映射）：'
+  say "ssh -N -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@服务器SSH地址 -p SSH外部端口"
+  if https_enabled; then
+    say "隧道地址：https://127.0.0.1:${PANEL_PORT}${path}（证书域名不匹配时浏览器会警告）"
+  else
+    say "隧道地址：http://127.0.0.1:${PANEL_PORT}${path}"
+  fi
 }
 install_dependencies(){
   if need_cmd apt-get; then apt-get update -y && apt-get install -y curl ca-certificates openssl tar gzip;
@@ -141,7 +213,7 @@ manage_credentials(){
     local u p
     u=$(prompt_user) || return 1
     p=$(prompt_password) || return 1
-    if x-ui setting -username "$u" -password "$p"; then systemctl restart x-ui; ok '账号密码已提交更新'; else err '修改失败，请进入官方菜单第 7 项操作'; fi
+    if "$(panel_binary)" setting -username "$u" -password "$p"; then systemctl restart x-ui; ok '账号密码已提交更新'; else err '修改失败，请进入官方菜单第 7 项操作'; fi
     unset p
   fi
 }
@@ -152,20 +224,39 @@ manage_path_port(){
   say '【修改面板端口与访问路径】'; say '1. 修改面板内部端口'; say '2. 修改访问路径'; say '0. 返回'; local c p
   ask c '请选择 [1/2/0]：' 0 || return 1
   case "$c" in
-    1) ask p '新内部端口：' "$PANEL_PORT" || return 1; valid_port "$p" || { err '端口无效'; return 1; }; if x-ui setting -port "$p"; then PANEL_PORT="$p"; [[ "$NETWORK_TYPE" == public ]] && EXTERNAL_PORT="$p"; save_config; systemctl restart x-ui; ok '面板端口已更新'; else err '官方命令执行失败'; fi;;
-    2) ask p '新访问路径（以 / 开头）：' "$WEB_PATH" || return 1; [[ "$p" =~ ^/[a-zA-Z0-9/_-]{6,128}$ ]] || { err '访问路径格式不正确'; return 1; }; if x-ui setting -webBasePath "$p"; then WEB_PATH="$p"; save_config; systemctl restart x-ui; ok '访问路径已更新'; else err '官方命令执行失败'; fi;;
+    1) ask p '新内部端口：' "$PANEL_PORT" || return 1; valid_port "$p" || { err '端口无效'; return 1; }; if "$(panel_binary)" setting -port "$p"; then PANEL_PORT="$p"; [[ "$NETWORK_TYPE" == public ]] && EXTERNAL_PORT="$p"; save_config; systemctl restart x-ui; ok '面板端口已更新'; else err '官方命令执行失败'; fi;;
+    2) ask p '新访问路径（以 / 开头）：' "$WEB_PATH" || return 1; [[ "$p" =~ ^/[a-zA-Z0-9/_-]{6,128}$ ]] || { err '访问路径格式不正确'; return 1; }; if "$(panel_binary)" setting -webBasePath "$p"; then WEB_PATH="$p"; save_config; systemctl restart x-ui; ok '访问路径已更新'; else err '官方命令执行失败'; fi;;
     0) return 0;; *) err '无效选择';;
   esac
 }
 ssl_paths(){ local d="$1"; CERT_DIR="/root/cert/$d"; CERT_FULL="$CERT_DIR/fullchain.pem"; CERT_KEY="$CERT_DIR/privkey.pem"; }
 ssl_apply(){
-  local d="$1"; ssl_paths "$d"
+  local d="$1" bin rc=0
+  ssl_paths "$d"
   [[ -s "$CERT_FULL" && -s "$CERT_KEY" ]] || { err '证书或私钥文件不存在'; return 1; }
-  if ! openssl x509 -in "$CERT_FULL" -noout -checkend 86400 >/dev/null 2>&1; then err '证书无效或即将过期'; return 1; fi
-  if ! x-ui setting -webCert "$CERT_FULL" -webCertKey "$CERT_KEY"; then err '自动绑定证书失败，请使用官方菜单 20 → 5 手动绑定'; return 1; fi
-  systemctl restart x-ui || { err '面板重启失败'; return 1; }
-  DOMAIN="$d"; HTTPS_MODE=verified; save_config; ok '证书已设置并重启面板';
-  warn 'HTTPS 已在面板配置，但公网 DNS、NAT 转发及实际连接仍需单独验证。'
+  if ! openssl x509 -in "$CERT_FULL" -noout -checkend 86400 >/dev/null 2>&1; then
+    err '证书无效或即将过期'; return 1
+  fi
+  bin=$(panel_binary) || { err '找不到 3X-UI 面板二进制程序，无法自动绑定证书'; return 1; }
+  # 注意：x-ui 是管理 shell 脚本，不支持 setting 子命令；需调用真正的面板二进制程序。
+  local output
+  output=$("$bin" setting -webCert "$CERT_FULL" -webCertKey "$CERT_KEY" 2>&1) || rc=$?
+  if (( rc != 0 )); then
+    err '面板证书设置命令失败，请使用官方管理菜单 20 → 5 手动绑定。'
+    printf '%s\n' "$output"
+    return 1
+  fi
+  PANEL_CERT_FILE=''; PANEL_KEY_FILE=''
+  read_panel_settings || true
+  if [[ "$PANEL_CERT_FILE" != "$CERT_FULL" || "$PANEL_KEY_FILE" != "$CERT_KEY" ]]; then
+    err '无法从面板数据库核实证书路径，未标记成功。请使用官方菜单 20 → 5 绑定。'
+    return 1
+  fi
+  if ! systemctl restart x-ui; then err '证书已写入，但面板重启失败'; return 1; fi
+  if ! service_active; then err '面板重启后未正常运行，请查看日志'; return 1; fi
+  DOMAIN="$d"; HTTPS_MODE=verified; save_config
+  ok '证书路径已写入面板并完成重启'
+  show_address
 }
 ssl_cloudflare(){
   local d token account zone acme
@@ -196,7 +287,7 @@ ssl_cloudflare(){
   "$acme" --install-cert --ecc -d "$d" --fullchain-file "$CERT_FULL" --key-file "$CERT_KEY" --reloadcmd 'x-ui restart' || { err '证书安装失败'; return 1; }
   chmod 600 "$CERT_KEY"; chmod 644 "$CERT_FULL"
   ok '证书签发成功，自动续期配置已提交';
-  if confirm '是否立即把此证书应用到 3X-UI 面板？'; then ssl_apply "$d"; else DOMAIN="$d"; save_config; fi
+  if confirm '是否立即把此证书应用到 3X-UI 面板？'; then ssl_apply "$d"; else DOMAIN="$d"; save_config; show_address; fi
 }
 ssl_menu(){
   local c d
