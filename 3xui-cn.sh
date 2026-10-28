@@ -93,4 +93,142 @@ new_install(){
   PANEL_USER="admin$(random_hex 4)"; PANEL_PASS="$(random_hex 16)"; WEB_PATH="/$(random_hex 12)";
   say; say '【HTTPS 证书】'; say '1. 安装后再配置 HTTPS（推荐 NAT VPS）'; say '2. 使用官方安装程序的域名证书流程（需要满足官方验证条件）';
   ask c '请选择 [1/2，默认 1]：' 1 || return 1
-  case "$c" in 1) HTTPS_MODE=none;; 2) HTTPS_MODE=official;; *) err '无效选择'; return 1;; esac
+  case "$c" in 1) HTTPS_MODE=none;; 2) HTTPS_MODE=official; if [[ -z "$DOMAIN" ]]; then err '官方域名证书模式必须先填写域名。NAT VPS 建议选择 1，安装后使用 Cloudflare DNS 申请证书。'; return 1; fi;; *) err '无效选择'; return 1;; esac
+  say; say '========== 安装前确认 ==========';
+  say "网络类型：$NETWORK_TYPE"; say "内部端口：$PANEL_PORT"; say "NAT 外部端口：${EXTERNAL_PORT:-未设置}"; say "域名：${DOMAIN:-未设置}";
+  say "HTTPS：$HTTPS_MODE"; say '1. 确认安装'; say '2. 返回主菜单';
+  ask c '请选择 [1/2]：' 2 || return 1; [[ "$c" == 1 ]] || return 0
+  install -d -m 700 "$LOG_DIR"
+  local installer log rc=0
+  installer=$(mktemp /tmp/3xui-official.XXXXXX.sh)
+  log=$(mktemp "$LOG_DIR/install.XXXXXX.log")
+  chmod 600 "$installer" "$log"
+  if ! need_cmd curl; then err '系统缺少 curl，请先安装 curl'; rm -f "$installer"; return 1; fi
+  info '正在下载 3X-UI 官方安装脚本...'
+  if ! curl -fLsS --retry 2 --connect-timeout 10 --max-time 90 "$OFFICIAL" -o "$installer"; then err '下载失败，请检查网络'; rm -f "$installer"; return 1; fi
+  if ! bash -n "$installer"; then err '官方脚本语法校验失败，已停止'; rm -f "$installer"; return 1; fi
+  info '正在安装依赖与 3X-UI，请稍候...'
+  install_dependencies > "$log" 2>&1 || { err "依赖安装失败，日志：$log"; rm -f "$installer"; return 1; }
+  XUI_NONINTERACTIVE=1 XUI_DB_TYPE=sqlite XUI_USERNAME="$PANEL_USER" XUI_PASSWORD="$PANEL_PASS" \
+  XUI_WEB_BASE_PATH="$WEB_PATH" XUI_PANEL_PORT="$PANEL_PORT" \
+  XUI_SSL_MODE="$( [[ "$HTTPS_MODE" == official ]] && printf domain || printf none )" \
+  XUI_DOMAIN="$DOMAIN" XUI_ENABLE_FAIL2BAN=false bash "$installer" >> "$log" 2>&1 || rc=$?
+  rm -f "$installer"
+  if (( rc != 0 )); then err "官方安装脚本执行失败（退出码 $rc），日志：$log"; return 1; fi
+  if ! installed || ! service_active; then err "安装程序已结束，但面板服务未确认运行；请查看日志：$log"; return 1; fi
+  if [[ "$HTTPS_MODE" == official ]]; then HTTPS_MODE=none; warn '请在证书管理中确认 HTTPS 是否真正启用，未验证前不标记成功。'; fi
+  save_config
+  ok '3X-UI 面板服务已启动'; say '========== 安装结果 ==========';
+  say "管理员账号：$PANEL_USER"; say "管理员密码：$PANEL_PASS"; say "访问路径：$WEB_PATH";
+  warn '请立即离线保存密码和路径，避免截图或公开。';
+  show_address; say "安装日志（仅 root 可读）：$log";
+}
+show_status(){ if installed; then if service_active; then ok '3X-UI 已安装，服务运行中'; else warn '3X-UI 已安装，服务未运行'; fi; else warn '3X-UI 尚未安装'; fi; }
+show_logs(){ if need_cmd journalctl; then journalctl -u x-ui -n 70 --no-pager || true; else err '系统没有 journalctl'; fi; }
+backup_db(){
+  local db='' dest
+  for db in /etc/x-ui/x-ui.db /usr/local/x-ui/x-ui.db; do [[ -f "$db" ]] && break; done
+  [[ -f "$db" ]] || { err '未找到 SQLite 数据库，请检查安装目录'; return 1; }
+  install -d -m 700 /root/3xui-backups
+  dest="/root/3xui-backups/x-ui-$(date -u +%Y%m%d-%H%M%S).db"
+  if need_cmd sqlite3; then sqlite3 "$db" ".backup '$dest'" || return 1; else cp -p "$db" "$dest" || return 1; warn '未安装 sqlite3，使用文件复制备份；高并发写入时建议改用 SQLite 在线备份。'; fi
+  chmod 600 "$dest"; ok "数据库备份已保存：$dest"
+}
+manage_credentials(){
+  installed || { err '尚未安装'; return 1; }
+  say '【修改管理员账号与密码】'; warn '优先使用官方管理命令，避免直接修改数据库。';
+  if confirm '是否修改账号和密码？'; then
+    local u p
+    u=$(prompt_user) || return 1
+    p=$(prompt_password) || return 1
+    if x-ui setting -username "$u" -password "$p"; then systemctl restart x-ui; ok '账号密码已提交更新'; else err '修改失败，请进入官方菜单第 7 项操作'; fi
+    unset p
+  fi
+}
+prompt_user(){ local u; ask u '请输入新管理员账号：' '' || return 1; [[ "$u" =~ ^[a-zA-Z0-9_-]{4,40}$ ]] || { err '账号必须为 4-40 位字母数字下划线或连字符'; return 1; }; printf '%s' "$u"; }
+prompt_password(){ local p; read -rs -p '请输入新管理员密码（至少 12 位）：' p; printf '\n' >&2; (( ${#p} >= 12 )) || { err '密码长度不足'; return 1; }; printf '%s' "$p"; }
+manage_path_port(){
+  installed || { err '尚未安装'; return 1; }
+  say '【修改面板端口与访问路径】'; say '1. 修改面板内部端口'; say '2. 修改访问路径'; say '0. 返回'; local c p
+  ask c '请选择 [1/2/0]：' 0 || return 1
+  case "$c" in
+    1) ask p '新内部端口：' "$PANEL_PORT" || return 1; valid_port "$p" || { err '端口无效'; return 1; }; if x-ui setting -port "$p"; then PANEL_PORT="$p"; [[ "$NETWORK_TYPE" == public ]] && EXTERNAL_PORT="$p"; save_config; systemctl restart x-ui; ok '面板端口已更新'; else err '官方命令执行失败'; fi;;
+    2) ask p '新访问路径（以 / 开头）：' "$WEB_PATH" || return 1; [[ "$p" =~ ^/[a-zA-Z0-9/_-]{6,128}$ ]] || { err '访问路径格式不正确'; return 1; }; if x-ui setting -webBasePath "$p"; then WEB_PATH="$p"; save_config; systemctl restart x-ui; ok '访问路径已更新'; else err '官方命令执行失败'; fi;;
+    0) return 0;; *) err '无效选择';;
+  esac
+}
+ssl_paths(){ local d="$1"; CERT_DIR="/root/cert/$d"; CERT_FULL="$CERT_DIR/fullchain.pem"; CERT_KEY="$CERT_DIR/privkey.pem"; }
+ssl_apply(){
+  local d="$1"; ssl_paths "$d"
+  [[ -s "$CERT_FULL" && -s "$CERT_KEY" ]] || { err '证书或私钥文件不存在'; return 1; }
+  if ! openssl x509 -in "$CERT_FULL" -noout -checkend 86400 >/dev/null 2>&1; then err '证书无效或即将过期'; return 1; fi
+  if ! x-ui setting -webCert "$CERT_FULL" -webCertKey "$CERT_KEY"; then err '自动绑定证书失败，请使用官方菜单 20 → 5 手动绑定'; return 1; fi
+  systemctl restart x-ui || { err '面板重启失败'; return 1; }
+  DOMAIN="$d"; HTTPS_MODE=verified; save_config; ok '证书已设置并重启面板';
+  warn 'HTTPS 已在面板配置，但公网 DNS、NAT 转发及实际连接仍需单独验证。'
+}
+ssl_cloudflare(){
+  local d token account zone acme
+  say '【Cloudflare DNS 验证申请证书】'; say '无需公网 80 端口。域名必须属于你有 DNS 编辑权限的 Cloudflare 区域。'
+  ask d '请输入证书域名：' "${DOMAIN:-}" || return 1
+  valid_domain "$d" || { err '域名格式不正确'; return 1; }
+  read -rs -p '输入 Cloudflare API Token（输入不回显）：' token || return 1; printf '\n'
+  [[ -n "$token" ]] || { err 'Token 不能为空'; return 1; }
+  ask zone 'Cloudflare Zone ID（可留空，由 acme.sh 自动识别）：' '' || return 1
+  ask account 'Cloudflare Account ID（可留空）：' '' || return 1
+  if ! need_cmd curl || ! need_cmd openssl; then err '缺少 curl 或 openssl'; return 1; fi
+  acme='/root/.acme.sh/acme.sh'
+  if [[ ! -x "$acme" ]]; then
+    say '检测到尚未安装 acme.sh。';
+    if ! confirm '是否从 acme.sh 官方站点下载安装脚本？'; then return 1; fi
+    local f; f=$(mktemp /tmp/acme-install.XXXXXX.sh)
+    if ! curl -fLsS --max-time 90 https://get.acme.sh -o "$f"; then err 'acme.sh 下载失败'; rm -f "$f"; return 1; fi
+    if ! bash -n "$f"; then err 'acme.sh 安装脚本语法异常'; rm -f "$f"; return 1; fi
+    bash "$f" || { rm -f "$f"; err 'acme.sh 安装失败'; return 1; }; rm -f "$f"
+  fi
+  [[ -x "$acme" ]] || { err 'acme.sh 不可执行'; return 1; }
+  info '正在使用 Cloudflare DNS 验证申请证书...'
+  local rc=0
+  CF_Token="$token" CF_Zone_ID="$zone" CF_Account_ID="$account" "$acme" --issue --dns dns_cf -d "$d" --keylength ec-256 --server letsencrypt || rc=$?
+  unset token
+  (( rc == 0 )) || { err '申请失败，请检查 Token 权限、域名所属 Zone 和日志'; return 1; }
+  ssl_paths "$d"; install -d -m 700 "$CERT_DIR"
+  "$acme" --install-cert --ecc -d "$d" --fullchain-file "$CERT_FULL" --key-file "$CERT_KEY" --reloadcmd 'x-ui restart' || { err '证书安装失败'; return 1; }
+  chmod 600 "$CERT_KEY"; chmod 644 "$CERT_FULL"
+  ok '证书签发成功，自动续期配置已提交';
+  if confirm '是否立即把此证书应用到 3X-UI 面板？'; then ssl_apply "$d"; else DOMAIN="$d"; save_config; fi
+}
+ssl_menu(){
+  local c d
+  say '【HTTPS / SSL 证书管理】'; say '1. 使用 Cloudflare DNS 申请证书（全中文流程）'; say '2. 绑定已经存在的证书'; say '3. 查看证书状态'; say '4. 官方 SSL 管理菜单（备用，部分英文）'; say '0. 返回';
+  ask c '请选择 [0-4]：' 0 || return 1
+  case "$c" in
+    1) ssl_cloudflare;;
+    2) ask d '证书域名：' "${DOMAIN:-}" || return 1; valid_domain "$d" || { err '域名无效'; return 1; }; ssl_apply "$d";;
+    3) if [[ -n "$DOMAIN" ]]; then ssl_paths "$DOMAIN"; if [[ -f "$CERT_FULL" ]]; then openssl x509 -in "$CERT_FULL" -noout -subject -dates; else warn '未找到该域名证书'; fi; else warn '尚未设置域名'; fi;;
+    4) x-ui && true;;
+    0) return 0;; *) err '无效选择';;
+  esac
+}
+nat_guide(){ say '【NAT VPS 配置指引】'; say '1. 在 3X-UI 内填写面板内部监听端口（例如 2053）。'; say '2. 在服务商 NAT 后台创建 TCP 外部端口 → 内部端口映射。'; say '3. 客户端连接时使用服务商分配的外部端口。'; say '4. 每条通过共享 IPv4 访问的入站通常需要独立端口映射。'; say '5. 域名 A 记录指向公网 IPv4；DNS 解析不等于端口映射。'; say '6. 未配置 HTTPS 时不要通过公网 HTTP 登录面板。'; say '7. 独立 IPv6 直连不依赖 IPv4 NAT，但需检查 IPv6 防火墙和监听。'; }
+sys_info(){ uname -a; sed -n '1,8p' /etc/os-release 2>/dev/null || true; free -h 2>/dev/null || true; df -h / 2>/dev/null || true; }
+update_panel(){ installed || { err '尚未安装面板'; return 1; }; warn '升级前建议先备份数据库。'; if confirm '是否进入官方更新流程？'; then x-ui; fi; }
+uninstall_panel(){ warn '卸载会影响现有面板和节点。'; if confirm '是否进入官方菜单自行确认卸载？'; then x-ui; fi; }
+main(){
+  require_root; load_config
+  while :; do
+    header; show_status; say
+    say '  1. 全新安装 3X-UI'; say '  2. 查看面板状态'; say '  3. 启动面板'; say '  4. 停止面板'; say '  5. 重启面板'; say '  6. 查看运行日志'; say '  7. 备份面板数据库'; say
+    say '  8. 修改管理员账号与密码'; say '  9. 修改面板端口与访问路径'; say ' 10. 配置 HTTPS / SSL 证书'; say ' 11. 查看面板访问地址'; say ' 12. NAT VPS 端口配置指引'; say ' 13. 配置面板访问方式'; say
+    say ' 14. 更新 3X-UI'; say ' 15. 查看系统与资源信息'; say ' 16. 进入官方管理菜单'; say ' 17. 卸载 3X-UI'; say; say '  0. 退出'; say
+    local c; ask c '请选择 [0-17]：' '' || break
+    case "$c" in
+      1) new_install;; 2) show_status;; 3) service_action start;; 4) service_action stop;; 5) service_action restart;; 6) show_logs;; 7) backup_db;;
+      8) manage_credentials;; 9) manage_path_port;; 10) ssl_menu;; 11) show_address;; 12) nat_guide;; 13) configure_access;;
+      14) update_panel;; 15) sys_info;; 16) if installed; then x-ui; else err '尚未安装 3X-UI'; fi;; 17) uninstall_panel;;
+      0) say '已退出。'; break;; *) err '无效选择';;
+    esac
+    say; wait_enter
+  done
+}
+main "$@"
