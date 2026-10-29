@@ -63,6 +63,26 @@ configure_access(){
 # 从真实的 3X-UI SQLite 设置读取端口、路径和证书，避免缓存配置误导用户。
 PANEL_CERT_FILE=''
 PANEL_KEY_FILE=''
+# 仅在需要读取面板数据库时补齐轻量级依赖，避免精简 VPS 手动排错。
+ensure_db_reader(){
+  if need_cmd python3 || need_cmd sqlite3; then return 0; fi
+  info '检测到系统缺少数据库读取工具，正在自动安装 sqlite3...'
+  if need_cmd apt-get; then
+    apt-get update -qq && apt-get install -y -qq sqlite3
+  elif need_cmd dnf; then
+    dnf install -y sqlite
+  elif need_cmd yum; then
+    yum install -y sqlite
+  elif need_cmd apk; then
+    apk add --no-cache sqlite
+  else
+    err '当前系统没有支持的包管理器，无法自动安装 sqlite3。'
+    return 1
+  fi || { err 'sqlite3 自动安装失败，请检查网络、软件源和磁盘剩余空间。'; return 1; }
+  if ! need_cmd sqlite3; then err '安装结束但仍找不到 sqlite3，无法安全核验面板设置。'; return 1; fi
+  ok '数据库读取依赖已就绪'
+}
+
 read_panel_settings(){
   local db='/etc/x-ui/x-ui.db' row k v
   [[ -f "$db" ]] || return 1
@@ -151,10 +171,10 @@ show_address(){
   fi
 }
 install_dependencies(){
-  if need_cmd apt-get; then apt-get update -y && apt-get install -y curl ca-certificates openssl tar gzip;
-  elif need_cmd dnf; then dnf install -y curl ca-certificates openssl tar gzip;
-  elif need_cmd yum; then yum install -y curl ca-certificates openssl tar gzip;
-  elif need_cmd apk; then apk add curl ca-certificates openssl tar gzip;
+  if need_cmd apt-get; then apt-get update -y && apt-get install -y curl ca-certificates openssl tar gzip sqlite3;
+  elif need_cmd dnf; then dnf install -y curl ca-certificates openssl tar gzip sqlite;
+  elif need_cmd yum; then yum install -y curl ca-certificates openssl tar gzip sqlite;
+  elif need_cmd apk; then apk add curl ca-certificates openssl tar gzip sqlite;
   else err '无法自动安装依赖，请先安装 curl、openssl、ca-certificates'; return 1; fi
 }
 new_install(){
@@ -233,6 +253,7 @@ ssl_paths(){ local d="$1"; CERT_DIR="/root/cert/$d"; CERT_FULL="$CERT_DIR/fullch
 ssl_apply(){
   local d="$1" bin rc=0
   ssl_paths "$d"
+  ensure_db_reader || return 1
   [[ -s "$CERT_FULL" && -s "$CERT_KEY" ]] || { err '证书或私钥文件不存在'; return 1; }
   if ! openssl x509 -in "$CERT_FULL" -noout -checkend 86400 >/dev/null 2>&1; then
     err '证书无效或即将过期'; return 1
